@@ -323,26 +323,6 @@ func (a *agentGRPC) updateContainerConfig(spec *specs.Spec, config *configs.Conf
 	return a.updateContainerConfigPrivileges(spec, config)
 }
 
-func addDevices(devices []*pb.Device, spec *pb.Spec) error {
-	for _, device := range devices {
-		if device == nil {
-			continue
-		}
-
-		devHandler, ok := deviceDriversHandlerList[device.Type]
-		if !ok {
-			return grpcStatus.Errorf(codes.InvalidArgument,
-				"Unknown device type %q", device.Type)
-		}
-
-		if err := devHandler(*device, spec); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func (a *agentGRPC) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*gpb.Empty, error) {
 	if a.sandbox.running == false {
 		return emptyResp, grpcStatus.Error(codes.FailedPrecondition, "Sandbox not started, impossible to run a new container")
@@ -362,7 +342,7 @@ func (a *agentGRPC) CreateContainer(ctx context.Context, req *pb.CreateContainer
 		return emptyResp, err
 	}
 
-	mountList, err := addMounts(req.Storages)
+	mountList, err := addStorages(req.Storages, req.OCI)
 	if err != nil {
 		return emptyResp, err
 	}
@@ -688,7 +668,7 @@ func (a *agentGRPC) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequ
 		}
 	}
 
-	mountList, err := addMounts(req.Storages)
+	mountList, err := addStorages(req.Storages, nil)
 	if err != nil {
 		return emptyResp, err
 	}

@@ -20,13 +20,18 @@ import (
 	grpcStatus "google.golang.org/grpc/status"
 )
 
+const (
+	driver9pType  = "9p"
+	driverBlkType = "blk"
+)
+
 type deviceDriversHandler func(device pb.Device, spec *pb.Spec) error
 
 var deviceDriversHandlerList = map[string]deviceDriversHandler{
-	"blk": blockDeviceHandler,
+	driverBlkType: deviceBlockDeviceDriverHandler,
 }
 
-func blockDeviceHandler(device pb.Device, spec *pb.Spec) error {
+func deviceBlockDeviceDriverHandler(device pb.Device, spec *pb.Spec) error {
 	// First need to make sure the expected device shows up properly,
 	// and then we need to retrieve its device info (such as major and
 	// minor numbers), useful to update the device provided
@@ -35,10 +40,11 @@ func blockDeviceHandler(device pb.Device, spec *pb.Spec) error {
 		return err
 	}
 
-	// If no ContainerPath is provided, this means we don't expect the
-	// device to be updated in the specification. We can return from here.
+	// If no ContainerPath is provided, we won't be able to match and
+	// update the device in the OCI spec device list. This is an error.
 	if device.ContainerPath == "" {
-		return nil
+		return grpcStatus.Errorf(codes.Internal,
+			"ContainerPath cannot be empty")
 	}
 
 	// At this point in the code, we assume the specification will be
@@ -151,6 +157,26 @@ func waitForDevice(devicePath string) error {
 		return grpcStatus.Errorf(codes.DeadlineExceeded,
 			"Timeout reached after %ds waiting for device %s",
 			timeoutHotplug, deviceName)
+	}
+
+	return nil
+}
+
+func addDevices(devices []*pb.Device, spec *pb.Spec) error {
+	for _, device := range devices {
+		if device == nil {
+			continue
+		}
+
+		devHandler, ok := deviceDriversHandlerList[device.Type]
+		if !ok {
+			return grpcStatus.Errorf(codes.InvalidArgument,
+				"Unknown device type %q", device.Type)
+		}
+
+		if err := devHandler(*device, spec); err != nil {
+			return err
+		}
 	}
 
 	return nil

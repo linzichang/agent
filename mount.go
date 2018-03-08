@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	pb "github.com/kata-containers/agent/protocols/grpc"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
@@ -143,31 +144,6 @@ func parseMountFlagsAndOptions(optionList []string) (int, string, error) {
 	return flags, strings.Join(options, ","), nil
 }
 
-func addMounts(mounts []*pb.Storage) ([]string, error) {
-	var mountList []string
-
-	for _, mnt := range mounts {
-		if mnt == nil {
-			continue
-		}
-
-		flags, options, err := parseMountFlagsAndOptions(mnt.Options)
-		if err != nil {
-			return nil, err
-		}
-
-		if err := mount(mnt.Source, mnt.MountPoint, mnt.Fstype,
-			flags, options); err != nil {
-			return nil, err
-		}
-
-		// Prepend mount point to mount list.
-		mountList = append([]string{mnt.MountPoint}, mountList...)
-	}
-
-	return mountList, nil
-}
-
 func removeMounts(mounts []string) error {
 	for _, mount := range mounts {
 		if err := syscall.Unmount(mount, 0); err != nil {
@@ -176,4 +152,102 @@ func removeMounts(mounts []string) error {
 	}
 
 	return nil
+}
+
+type storageDriversHandler func(storage pb.Storage, spec *pb.Spec) (string, error)
+
+var storageDriversHandlerList = map[string]storageDriversHandler{
+	driver9pType:  storage9pDriverHandler,
+	driverBlkType: storageBlockDeviceDriverHandler,
+}
+
+func storage9pDriverHandler(storage pb.Storage, spec *pb.Spec) (string, error) {
+	return commonStorageHandler(storage, spec)
+}
+
+func storageBlockDeviceDriverHandler(storage pb.Storage, spec *pb.Spec) (string, error) {
+	// First need to make sure the expected device shows up properly.
+	if err := waitForDevice(storage.Source); err != nil {
+		return "", err
+	}
+
+	return commonStorageHandler(storage, spec)
+}
+
+func commonStorageHandler(storage pb.Storage, spec *pb.Spec) (string, error) {
+	if storage.Rootfs {
+		// Mount the storage device.
+		if err := mountStorage(storage); err != nil {
+			return "", err
+		}
+
+		return storage.MountPoint, nil
+	}
+
+	// Update list of Mounts from OCI specification.
+	updateOCIMounts(storage, spec)
+
+	return "", nil
+}
+
+func mountStorage(storage pb.Storage) error {
+	flags, options, err := parseMountFlagsAndOptions(storage.Options)
+	if err != nil {
+		return err
+	}
+
+	return mount(storage.Source, storage.MountPoint, storage.Fstype, flags, options)
+}
+
+func updateOCIMounts(storage pb.Storage, spec *pb.Spec) {
+	if spec == nil {
+		return
+	}
+
+	// Update the spec if there is a corresponding Mount.
+	for idx, mnt := range spec.Mounts {
+		if mnt.Destination == storage.MountPoint {
+			agentLog.WithFields(logrus.Fields{
+				"old-mount-source":  spec.Mounts[idx].Source,
+				"new-mount-source":  storage.Source,
+				"old-mount-fstype":  spec.Mounts[idx].Type,
+				"new-mount-fstype":  storage.Fstype,
+				"old-mount-options": spec.Mounts[idx].Options,
+				"new-mount-options": storage.Options,
+				"destination":       storage.MountPoint,
+			}).Info("updating OCI mount entry")
+			spec.Mounts[idx].Source = storage.Source
+			spec.Mounts[idx].Type = storage.Fstype
+			spec.Mounts[idx].Options = storage.Options
+			break
+		}
+	}
+}
+
+func addStorages(storages []*pb.Storage, spec *pb.Spec) ([]string, error) {
+	var mountList []string
+
+	for _, storage := range storages {
+		if storage == nil {
+			continue
+		}
+
+		devHandler, ok := storageDriversHandlerList[storage.Driver]
+		if !ok {
+			return nil, grpcStatus.Errorf(codes.InvalidArgument,
+				"Unknown storage driver %q", storage.Driver)
+		}
+
+		mountPoint, err := devHandler(*storage, spec)
+		if err != nil {
+			return nil, err
+		}
+
+		if mountPoint != "" {
+			// Prepend mount point to mount list.
+			mountList = append([]string{mountPoint}, mountList...)
+		}
+	}
+
+	return mountList, nil
 }
